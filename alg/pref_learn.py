@@ -13,7 +13,7 @@ from aprel.basics.environment import Environment
 from aprel.basics.trajectory import TrajectorySet
 from aprel.learning.belief_models import SamplingBasedBelief
 from aprel.learning.data_types import Preference, PreferenceQuery
-from aprel.learning.user_models import SoftmaxUser
+from aprel.learning.user_models import SoftmaxUser,HumanUser
 from aprel.querying.query_optimizer import QueryOptimizerDiscreteTrajectorySet
 from envs.task_envs import PnPNewRobotEnv
 from utils.env_wrappers import (
@@ -26,20 +26,12 @@ from utils.env_wrappers import (
 
 
 def setup_environment(*, render: bool = False) -> Any:
-    """Construct and initialise the Pick-and-Place environment with standard wrappers.
-
-    Wrapper stack (inner → outer):
-    PnPNewRobotEnv → ResetWrapper → ActionNormalizer → TimeLimitWrapper (150 steps).
-
-    The environment is seeded with seed=0 immediately after construction.
-
-    Args:
-        render: If True, opens a PyBullet GUI window.
-
-    Returns:
-        The fully wrapped, reset environment.
-    """
-    pass
+    env = PnPNewRobotEnv(render=render)
+    env = ResetWrapper(env)
+    env = ActionNormalizer(env)
+    env = TimeLimitWrapper(env, max_steps=150)
+    env.reset(seed=0)
+    return env
 
 
 def learn_weights(
@@ -47,31 +39,27 @@ def learn_weights(
     *,
     num_queries: int = 10,
     seed: int = 0,
-    acquisition_function: str
+    acquisition_function: str = "mutual_information"
 ) -> np.ndarray:
-    """Run an active preference learning loop to infer reward feature weights.
+    np.random.seed(seed)
 
-    Uses APReL's query optimizer together with a SamplingBasedBelief.  At each
-    iteration a pair of trajectories is selected and shown to the human annotator
-    via query.visualize().  The annotator's response updates the belief.
+    dim = traj_set[0].features.shape[0]
+    initial_weights = util_funs.get_random_normalized_vector(dim)
 
-    Args:
-        traj_set: The discrete set of candidate trajectories to query over.
-        num_queries: Number of preference queries to collect from the human.
-        seed: Seed for numpy's global RNG.
-        acquisition_function: Name of an acquisition function to use:
-            - `disagreement`: Based on `Katz. et al. (2019) <https://arxiv.org/abs/1907.05575>`_.
-            - `mutual_information`: Based on `Bıyık et al. (2019) <https://arxiv.org/abs/1910.04365>`_.
-            - `random`: Randomly chooses a query.
-            - `regret`: Based on `Wilde et al. (2020) <https://arxiv.org/abs/2005.04067>`_.
-            - `thompson`: Based on `Tucker et al. (2019) <https://arxiv.org/abs/1909.12316>`_.
-            - `volume_removal`: Based on `Sadigh et al. (2017) <http://m.roboticsproceedings.org/rss13/p53.pdf>`_ and `Bıyık et al. <https://arxiv.org/abs/1904.02209>`_.
+    user_model = SoftmaxUser({"weights": initial_weights})
+    belief = SamplingBasedBelief(user_model, [], {"weights": initial_weights})
+    optimizer = QueryOptimizerDiscreteTrajectorySet(traj_set)
+    human = HumanUser(delay=0.5)
 
-    Returns:
-        A float32 array of shape (feature_dim,) containing the posterior
-        mean reward weights after all queries have been collected.
-    """
-    pass
+    query_template = PreferenceQuery(traj_set[:2])
+
+    for i in range(num_queries):
+        print(f"\nQuery {i + 1} / {num_queries}  (acquisition: {acquisition_function})")
+        queries, _ = optimizer.optimize(acquisition_function, belief, query_template)
+        responses = human.respond(queries[0])
+        belief.update(Preference(queries[0], responses[0]))
+
+    return np.array(belief.mean["weights"], dtype=np.float32)
 
 
 def save_weights(weights: np.ndarray, out_path: Path) -> None:
