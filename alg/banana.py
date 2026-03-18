@@ -13,23 +13,26 @@ from utils.env_wrappers import ActionNormalizer, ResetWrapper, TimeLimitWrapper,
 
 
 def feature_function(traj_pairs: List[Tuple[Dict[str, np.ndarray], np.ndarray]]) -> np.ndarray:
-    """Compute a feature vector summarising a trajectory.
+    if not traj_pairs:
+        return np.zeros(3, dtype=np.float32)
 
-    The designed features are:
-    ##########################
-          Your Features
-    ##########################
+    ee_to_banana_dists = []
+    banana_to_plate_dists = []
 
-    Args:
-        traj_pairs: A list of (state_dict, action) tuples produced by rollout
-            or random_rollout.  Each state_dict must contain the keys
-            "observation" (raw obs array, object xyz at indices 7–9) and
-            "desired_goal" (goal xyz).
+    for state, action in traj_pairs:
+        obs = state["observation"]
+        goal = state["desired_goal"]
+        ee_pos = obs[0:3]
+        banana_pos = obs[7:10]
+        ee_to_banana_dists.append(np.linalg.norm(ee_pos - banana_pos))
+        banana_to_plate_dists.append(np.linalg.norm(banana_pos - goal))
 
-    Returns:
-        A float32 array of shape (d,).  Returns the zero vector for empty input.
-    """
-    pass
+    # Higher value = better (negative distance so closer = higher reward)
+    f1 = -float(np.min(ee_to_banana_dists))       # arm approached banana
+    f2 = -float(np.min(banana_to_plate_dists))     # banana got close to plate
+    f3 = -float(banana_to_plate_dists[-1])         # banana ended close to plate
+
+    return np.array([f1, f2, f3], dtype=np.float32)
 
 def capture_frame(env: Any, width: int = 320, height: int = 240) -> np.ndarray:
     """Render the current simulation state to an image via PyBullet offscreen rendering.
@@ -80,20 +83,13 @@ def capture_frame(env: Any, width: int = 320, height: int = 240) -> np.ndarray:
 
 
 def setup_environment(*, render: bool = False) -> Any:
-    """Construct and initialise the Pick-and-Place environment with standard wrappers.
+    env = PnPNewRobotEnv(render=render)
+    env = ResetWrapper(env)
+    env = ActionNormalizer(env)
+    env = TimeLimitWrapper(env, max_steps=150)
+    env.reset(seed=0)
+    return env
 
-    Wrapper stack (inner → outer):
-    PnPNewRobotEnv → ResetWrapper → ActionNormalizer → TimeLimitWrapper (150 steps).
-
-    The environment is seeded with seed=0 immediately after construction.
-
-    Args:
-        render: If True, opens a PyBullet GUI window.
-
-    Returns:
-        The fully wrapped, reset environment.
-    """
-    pass
 
 
 def rollout(
@@ -103,31 +99,21 @@ def rollout(
     options: Optional[Dict[str, Any]] = None,
     max_steps: int = 150,
 ) -> Tuple[List[Tuple[Dict[str, np.ndarray], np.ndarray]], List[np.ndarray]]:
-    """Execute a fixed action sequence in the environment and record the trajectory.
-
-    Args:
-        env: Wrapped gym environment (see setup_environment).
-        action_seq: Array of shape (T, action_dim) containing the pre-recorded
-            actions to replay.
-        options: Optional reset options forwarded to env.reset.
-        max_steps: Hard cap on the number of steps executed, regardless of
-            action_seq length.
-
-    Returns:
-        A tuple (traj_pairs, frames) where:
-            * traj_pairs is a list of (state dict, action) pairs;
-            * frames is a list of uint8 RGB arrays captured after each step.
-    """
     T = min(int(action_seq.shape[0]), int(max_steps))
-    frames: List[np.ndarray] = []
     traj_pairs: List[Tuple[Dict[str, np.ndarray], np.ndarray]] = []
+    frames: List[np.ndarray] = []
 
     state, _info = env.reset(seed=0, options=options)
     frames.append(capture_frame(env))
 
     for t in range(T):
-
-        pass
+        action = action_seq[t]
+        next_state, reward, terminated, truncated, info = env.step(action)
+        traj_pairs.append((state, action))
+        frames.append(capture_frame(env))
+        state = next_state
+        if terminated or truncated:
+            break
 
     return traj_pairs, frames
 
@@ -137,21 +123,22 @@ def random_rollout(
     *,
     max_steps: int = 150,
 ) -> Tuple[List[Tuple[Dict[str, np.ndarray], np.ndarray]], List[np.ndarray]]:
-    """Execute a random policy in the environment and record the trajectory.
+    traj_pairs: List[Tuple[Dict[str, np.ndarray], np.ndarray]] = []
+    frames: List[np.ndarray] = []
 
-    Actions are sampled uniformly from env.action_space at every step.
+    state, _info = env.reset(seed=None)
+    frames.append(capture_frame(env))
 
-    Args:
-        env: Wrapped gym environment (see :setup_environment).
-        max_steps: Maximum number of environment steps to execute.
+    for _ in range(max_steps):
+        action = env.action_space.sample()
+        next_state, reward, terminated, truncated, info = env.step(action)
+        traj_pairs.append((state, action))
+        frames.append(capture_frame(env))
+        state = next_state
+        if terminated or truncated:
+            break
 
-    Returns:
-        A tuple (traj_pairs, frames) where:
-            * traj_pairs is a list of (state dict, action) pairs;
-            * frames is a list of uint8 RGB arrays.
-    """
-
-    pass
+    return traj_pairs, frames
 
 
 def main() -> None:
@@ -188,10 +175,26 @@ def main() -> None:
     print(f"\nGenerating {len(demos)} expert clips")
 
     for i, demo in enumerate(demos):
-        pass
+        obj_pos = demo["state_trajectory"][0][7:10]
+        options = {"whether_random": False, "object_pos": obj_pos}
+        traj_pairs, frames = rollout(env, demo["action_trajectory"], options=options)
+        features = feature_function(traj_pairs)
+        clip_path = str(clips_dir / f"expert_{i:02d}.mp4")
+        with imageio.get_writer(clip_path, **writer_kwargs) as writer:
+            for frame in frames:
+                writer.append_data(frame)
+        saved_records.append(TrajectoryRecord(clip_path=clip_path, features=features))
 
 
     print(f"\nGenerating 10 random clips")
+    for i in range(10):
+        traj_pairs, frames = random_rollout(env)
+        features = feature_function(traj_pairs)
+        clip_path = str(clips_dir / f"random_{i:02d}.mp4")
+        with imageio.get_writer(clip_path, **writer_kwargs) as writer:
+            for frame in frames:
+                writer.append_data(frame)
+        saved_records.append(TrajectoryRecord(clip_path=clip_path, features=features))
 
 
 
