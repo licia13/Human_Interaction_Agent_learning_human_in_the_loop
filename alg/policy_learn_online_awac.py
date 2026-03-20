@@ -332,7 +332,7 @@ def main() -> None:
             # 6) Add rolled-out trajectory to APReL dataset + save clip
             # ---------------------------------------------------------
             clip_path = clips_dir / f"online_awac_ep{episode_idx:04d}_step{total_steps:07d}.mp4"
-            save_frames_to_mp4(frames, clip_path=clip_path)
+            save_frames_to_mp4(frames, out_path=clip_path)
 
             online_record = TrajectoryRecord(
                 clip_path=str(clip_path),
