@@ -1,0 +1,372 @@
+\documentclass[hyperref={colorlinks,citecolor=blue,linkcolor=blue,urlcolor=blue}, 9pt]{beamer}
+
+\mode<presentation>{
+  \usetheme{Madrid}
+  \usecolortheme{crane}
+  \usefonttheme{serif}
+  \setbeamertemplate{navigation symbols}{}
+  \setbeamertemplate{caption}[numbered]
+}
+
+\usepackage[english]{babel}
+\usepackage[utf8]{inputenc}
+\usepackage{tikz}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+
+% ---------- Title ----------
+\title[HIAL — Preference + RLfD]{HIAL Project: Preference-Based Reward Learning and\\RL from Demonstrations (UR5 Food-Serving)}
+\subtitle{Step-by-step explanation of what we do and why}
+\author{Licia Tauriello}
+\institute{HIAL Project}
+\date{\today}
+
+\begin{document}
+
+% ---------- Title slide ----------
+\begin{frame}
+  \titlepage
+\end{frame}
+
+% ---------- Index ----------
+\begin{frame}{Agenda}
+\tableofcontents
+\end{frame}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{What Are We Trying To Do?}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{frame}{The task}
+We train a robot arm to:
+\begin{itemize}
+  \item pick up a banana in a scene,
+  \item move it toward the plate (goal position),
+  \item place the banana successfully.
+\end{itemize}
+
+The robot is simulated in PyBullet using a Panda-gym based environment.
+\end{frame}
+
+\begin{frame}{Why we need learning (intution first)}
+We want a neural policy:
+\begin{itemize}
+  \item It observes the current state of the robot and banana,
+  \item produces an action (robot movement + gripper command),
+  \item repeats until either success or time limit.
+\end{itemize}
+
+\textbf{Core idea:} the policy improves because it receives feedback via reward.
+\end{frame}
+
+\begin{frame}{The sparse reward problem}
+The environment reward is sparse:
+\begin{itemize}
+  \item large positive reward only when the banana is placed on the plate,
+  \item otherwise a small negative reward each step.
+\end{itemize}
+
+\textbf{If the robot starts randomly:}
+\begin{itemize}
+  \item it rarely succeeds by chance,
+  \item it gets almost no useful “directional” learning signal.
+\end{itemize}
+
+So we replace that with a learned reward that can guide behavior earlier.
+\end{frame}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Data We Have (and what it really means)}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{frame}{Do we have a “database”?}
+Conceptually, yes, but it is not like a labeled dataset of “good/bad”.
+Instead we have:
+\begin{itemize}
+  \item \textbf{Expert demonstrations} (successful episodes)
+  \item \textbf{Clips} generated from demos and random rollouts
+  \item \textbf{Human preferences} comparing pairs of clips
+  \item \textbf{Learned reward weights} obtained from those preferences
+  \item \textbf{Replay buffer} (a dataset of transitions used by RL)
+\end{itemize}
+
+Each part plays a role in making learning possible.
+\end{frame}
+
+\begin{frame}{What is inside an expert demo?}
+An expert demo contains one \textbf{episode trajectory} with tensors over time:
+\begin{itemize}
+  \item \texttt{state\_trajectory}: state at each step
+  \item \texttt{action\_trajectory}: action taken at each step
+  \item \texttt{next\_state\_trajectory}: next state after each action
+  \item \texttt{done\_trajectory}: whether the episode ended at that step
+\end{itemize}
+
+In other words, it is a sequence of transitions $(s_t, a_t, s_{t+1}, done_t)$.
+\end{frame}
+
+\begin{frame}{What is the state / action?}
+The environment state is a dictionary with:
+\begin{itemize}
+  \item \texttt{observation}: robot + banana information (20 dims)
+  \item \texttt{achieved\_goal}: banana position (3 dims)
+  \item \texttt{desired\_goal}: fixed target plate position (3 dims)
+\end{itemize}
+
+Action is a continuous vector controlling:
+\begin{itemize}
+  \item end-effector displacement (dx,dy,dz),
+  \item gripper command.
+\end{itemize}
+
+So the problem is: learn the mapping state $\rightarrow$ action.
+\end{frame}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Phase 1.1 — Generate Clips + Design Features}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{frame}{What Phase 1.1 requires}
+We must generate 30 trajectory clips:
+\begin{itemize}
+  \item 20 from \textbf{expert demos}
+  \item 10 from \textbf{random actions}
+\end{itemize}
+
+And we must compute a \textbf{feature vector} for each trajectory.
+These features are what the reward learning will later weight.
+\end{frame}
+
+\begin{frame}{Step-by-step: what \texttt{banana.py} does}
+\textbf{Step 1:} load expert demos from \texttt{demo\_data/PickAndPlace}
+
+\textbf{Step 2:} for each demo episode
+\begin{itemize}
+  \item replay the demo in the environment,
+  \item render frames and save an MP4 clip,
+  \item compute features $\phi(\tau)$ from the whole episodic trajectory.
+\end{itemize}
+
+\textbf{Step 3:} generate 10 random episodes
+\begin{itemize}
+  \item sample random actions each time step,
+  \item save the clips,
+  \item compute features for those bad trajectories too.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{What are “features” and why do we need them?}
+We cannot directly learn a reward function from raw physics.
+Instead, we define a \textbf{hand-engineered feature map}:
+\[
+\phi(\tau) = [f_1(\tau), f_2(\tau), f_3(\tau)]
+\]
+
+Each $f_i(\tau)$ measures something meaningful about the trajectory, like:
+\begin{itemize}
+  \item did the arm approach the banana?
+  \item did the banana approach the plate?
+  \item did it end close to the goal?
+\end{itemize}
+
+The learned reward will be:
+\[
+R(\tau) = w^\top \phi(\tau)
+\]
+where $w$ is learned from preferences.
+\end{frame}
+
+\begin{frame}{Where $\phi(\tau)$ comes from (intuitive view)}
+In our implementation, the features are based on distances:
+\begin{itemize}
+  \item distances from end-effector to banana,
+  \item distances from banana to plate (min and final).
+\end{itemize}
+
+We negate distances so that:
+\begin{itemize}
+  \item smaller distance $\Rightarrow$ larger reward feature value.
+\end{itemize}
+\end{frame}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Phase 1.2 — Preference Learning with APReL}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{frame}{What Phase 1.2 requires}
+A human teacher compares trajectories by watching clips.
+For each comparison:
+\begin{itemize}
+  \item the system shows two trajectory clips,
+  \item the human chooses which one is preferred.
+\end{itemize}
+
+We are limited to \textbf{10} total queries.
+
+The goal is to infer the reward weights $w$ that make the preferred trajectory score higher.
+\end{frame}
+
+\begin{frame}{Step-by-step: what \texttt{pref\_learn.py} does}
+\textbf{Step 1:} convert the saved clip records into an APReL \texttt{TrajectorySet}.
+Each trajectory has a feature vector $\phi(\tau)$.
+
+\textbf{Step 2:} initialize a belief over weights:
+\begin{itemize}
+  \item APReL maintains a distribution of possible $w$ values consistent with previous answers.
+\end{itemize}
+
+\textbf{Step 3:} repeat for 10 queries:
+\begin{itemize}
+  \item choose a pair of trajectories to ask about (using an acquisition function),
+  \item show clips to the human,
+  \item human selects the preferred one,
+  \item update the belief/posterior using that preference.
+\end{itemize}
+
+\textbf{Step 4:} output posterior mean weights $w$ and save them to:
+\texttt{saved/feature\_weights.csv}
+\end{frame}
+
+\begin{frame}{How the human feedback “teaches” reward}
+Suppose the human picks trajectory A over B.
+Intuitively, we want:
+\[
+w^\top \phi(\tau_A) > w^\top \phi(\tau_B)
+\]
+
+Across 10 comparisons, APReL finds weights $w$ that best explain why the human consistently preferred the chosen clips.
+That is why we needed both good (experts) and bad (random) trajectories:
+random ones provide contrast.
+\end{frame}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Phase 2 — RL from Demonstrations (episodic training)}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{frame}{What Phase 2 requires (the assignment loop)}
+The assignment asks for an \textbf{episodic training loop}:
+\begin{enumerate}
+  \item Roll out the current policy for one full episode.
+  \item Recover reward for that episode using the learned reward weights.
+  \item Store the transitions into a replay buffer.
+  \item Update the policy.
+\end{enumerate}
+
+This differs from “standard RL” which mixes rewards step-by-step from env output.
+Here we do \textbf{post-hoc reward recovery} from the entire episode.
+\end{frame}
+
+\begin{frame}{Step-by-step: what \texttt{policy\_learn.py} does (SAC)}
+\textbf{Step 0:} pre-fill replay buffer with 20 expert demos
+\begin{itemize}
+  \item For each expert episode, compute $R(\tau)=w^\top\phi(\tau)$,
+  \item distribute it across steps to create per-step rewards,
+  \item add transitions to the buffer.
+\end{itemize}
+
+\textbf{Step 1:} roll out ONE episode using the current SAC policy
+\begin{itemize}
+  \item collect $\{(s_t, a_t)\}$ as trajectory pairs (for $\phi(\tau)$),
+  \item collect transition tuples $(s_t,a_t,s_{t+1},done_t)$ for the replay buffer.
+\end{itemize}
+
+\textbf{Step 2:} recover episode reward post-hoc
+\begin{itemize}
+  \item compute $\phi(\tau)$ from trajectory pairs,
+  \item compute $R(\tau)=w^\top \phi(\tau)$,
+  \item define $r_t = R(\tau)/T$ for each step $t$.
+\end{itemize}
+
+\textbf{Step 3:} train SAC using off-policy updates from the replay buffer.
+\end{frame}
+
+\begin{frame}{How can the robot learn from the expert demos?}
+Because expert demos provide valuable transitions early:
+\begin{itemize}
+  \item the replay buffer initially contains behavior close to success,
+  \item critics learn value estimates on those state-action pairs,
+  \item actors learn to improve toward higher-value actions.
+\end{itemize}
+
+So the robot does not start learning from scratch.
+It starts from something like “good behavior already exists in memory”.
+Then RL improves it.
+\end{frame}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{SAC vs AWAC (what to say in the report)}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{frame}{SAC (conceptual summary)}
+SAC is an actor-critic method with entropy regularization:
+\begin{itemize}
+  \item critic learns $Q(s,a)$ (value),
+  \item actor learns a policy that picks actions with higher $Q$,
+  \item entropy encourages exploration.
+\end{itemize}
+
+It’s general-purpose and strong when you have a reasonable reward signal.
+\end{frame}
+
+\begin{frame}{AWAC (conceptual summary)}
+AWAC is another actor-critic method but its actor update is special:
+\begin{itemize}
+  \item it computes an advantage $A(s,a)=Q(s,a)-V(s)$,
+  \item it assigns higher weight to actions that have positive advantage,
+  \item it pulls the policy toward demo-like “good” actions more strongly.
+\end{itemize}
+
+This makes it a good choice for imitation / RLfD settings.
+\end{frame}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Evaluation + Visualization}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{frame}{What success means (how we measure learning)}
+We evaluate the learned policy by running multiple test episodes:
+\begin{itemize}
+  \item reset environment randomly,
+  \item roll out deterministic policy,
+  \item count success when \texttt{info["is\_success"] = True}.
+\end{itemize}
+
+We report:
+\[
+\text{success rate} = \frac{\#\text{successful episodes}}{\#\text{episodes}}
+\]
+averaged over 10 runs.
+\end{frame}
+
+\begin{frame}{What plots you can show}
+To compare SAC vs AWAC, we track:
+\begin{itemize}
+  \item success rate over environment steps,
+  \item episode reward (mean trajectory reward),
+  \item episode length,
+  \item actor loss and critic loss (optimization signals).
+\end{itemize}
+
+These come from the metrics CSVs generated during training.
+\end{frame}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Conclusion}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{frame}{Conclusion (what to write in your report)}
+We solved sparse reward learning by:
+\begin{itemize}
+  \item designing trajectory-level features $\phi(\tau)$,
+  \item using APReL + human preferences to learn reward weights $w$,
+  \item converting those weights into a dense, episode-based reward,
+  \item training RL policies from expert demonstrations with an episodic loop.
+\end{itemize}
+
+Then we compare SAC vs AWAC using the same evaluation metric.
+\end{frame}
+
+\end{document}
