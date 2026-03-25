@@ -17,13 +17,17 @@ def feature_function(traj_pairs: List[Tuple[Dict[str, np.ndarray], np.ndarray]])
     Trajectory-level feature map φ(τ) used to define the learned reward:
         R(τ) = w^T φ(τ)
 
-    Compared to the original distance-only features, this version adds:
-      - lift progress (banana height above table)
-      - goal progress from start to end
-      - a grasp proxy using gripper closure and EE proximity
-
     Output dimensionality:
       6 features: [f1, f2, f3, f4, f5, f6]
+
+    Features:
+      f1: -min(Ee->banana distance)
+      f2: -min(banana->plate distance)
+      f3: -end(banana->plate distance)
+      f4: max banana height above table (lift)
+      f5: improvement in banana->plate distance (start->end)
+      f6: lift achieved soon after a grasp-like event (better than rewarding
+          gripper closing alone).
     """
     if not traj_pairs:
         return np.zeros(6, dtype=np.float32)
@@ -36,18 +40,22 @@ def feature_function(traj_pairs: List[Tuple[Dict[str, np.ndarray], np.ndarray]])
     ee_to_banana_dists: List[float] = []
     banana_to_plate_dists: List[float] = []
     banana_heights: List[float] = []
-    grasp_proxy_sum = 0.0
+    grasp_events: List[bool] = []
 
-    # Task configuration: banana starts on the table around z ~= 0.02.
-    # Using this as a stable reference for "lift".
+    # Banana starts on the table around z ~= 0.02.
     table_z = 0.02
+
+    # Thresholds tuned to the scale in `demo_data/PickAndPlace` state/action arrays.
+    # In the demo trajectories, the minimum EE->banana distance is ~0.14,
+    # so a threshold like 0.04 never triggers.
+    GRASP_EE_BANANA_DIST = 0.16
+    GRIPPER_CLOSING_CMD = 0.0
 
     for state, action in traj_pairs:
         obs = state["observation"]
         goal = state["desired_goal"]
 
         ee_pos = obs[0:3]
-        finger_width = float(obs[6])
         banana_pos = obs[7:10]
 
         d_ee_banana = float(np.linalg.norm(ee_pos - banana_pos))
@@ -57,29 +65,32 @@ def feature_function(traj_pairs: List[Tuple[Dict[str, np.ndarray], np.ndarray]])
         banana_to_plate_dists.append(d_banana_goal)
         banana_heights.append(float(banana_pos[2]))
 
-        # Grasp proxy (not perfect, but improves preference alignment):
-        # reward is higher when:
-        #   - EE is close to banana
-        #   - and either the gripper is closing (action[3] > threshold)
-        close_enough = 1.0 if d_ee_banana < 0.04 else 0.0
-        closing = 1.0 if float(action[3]) > 0.2 else 0.0
-
-        # Narrow gripper opening in observation also indicates "near grasp"
-        # (finger_width smaller => gripper closer to closed).
-        narrow_gripper = 1.0 if finger_width < 0.04 else 0.0
-
-        grasp_proxy_sum += close_enough * max(closing, narrow_gripper)
+        # Grasp-like event detector:
+        # EE close to banana AND commanded gripper closing.
+        close_enough = d_ee_banana < GRASP_EE_BANANA_DIST
+        # The UR5 gripper action closes when action > 0 (after normalization).
+        closing_cmd = float(action[3]) > GRIPPER_CLOSING_CMD
+        grasp_events.append(bool(close_enough and closing_cmd))
 
     start_goal_dist = banana_to_plate_dists[0]
     end_goal_dist = banana_to_plate_dists[-1]
 
     # Higher feature values = better trajectory.
-    f1 = -float(np.min(ee_to_banana_dists))                    # approached banana
-    f2 = -float(np.min(banana_to_plate_dists))                 # banana got close to plate
-    f3 = -float(end_goal_dist)                                # banana ended close to plate
-    f4 = float(np.max(banana_heights) - table_z)              # lift above table
-    f5 = float(start_goal_dist - end_goal_dist)             # reduced goal distance from start->end
-    f6 = float(grasp_proxy_sum / max(len(traj_pairs), 1))       # average grasp proxy
+    f1 = -float(np.min(ee_to_banana_dists))           # approached banana
+    f2 = -float(np.min(banana_to_plate_dists))       # banana got close to plate
+    f3 = -float(end_goal_dist)                       # banana ended close to plate
+    f4 = float(np.max(banana_heights) - table_z)    # lift above table
+    f5 = float(start_goal_dist - end_goal_dist)     # reduced goal distance
+
+    # f6: maximum lift achieved anywhere after the first grasp-like event.
+    # This avoids making the proxy brittle to the exact timing window.
+    lift_amounts = [max(0.0, z - table_z) for z in banana_heights]
+    grasp_indices = [i for i, did_grasp in enumerate(grasp_events) if did_grasp]
+    if len(grasp_indices) == 0:
+        f6 = 0.0
+    else:
+        i0 = int(min(grasp_indices))
+        f6 = float(np.max(lift_amounts[i0:])) if i0 < len(lift_amounts) else 0.0
 
     return np.array([f1, f2, f3, f4, f5, f6], dtype=np.float32)
 

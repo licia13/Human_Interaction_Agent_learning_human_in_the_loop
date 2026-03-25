@@ -305,6 +305,9 @@ def load_demos_into_buffer(
         actions = demo["action_trajectory"]
         next_states = demo["next_state_trajectory"]
         dones = demo["done_trajectory"].flatten()
+        # Distinguish true task termination (success) from time-limit truncation.
+        # In this project, sparse reward is positive (+1000) only on success.
+        demo_rewards = demo.get("reward_trajectory", np.zeros_like(dones)).flatten()
         T = len(actions)
 
         # Build traj_pairs with dict obs so feature_function can parse them
@@ -334,7 +337,9 @@ def load_demos_into_buffer(
             replay_buffer.add(
                 flat_obs, flat_next_obs,
                 actions[t].astype(np.float32),
-                reward_per_step, bool(dones[t]),
+                reward_per_step,
+                # Mark as terminal only on true termination (success), not timeouts.
+                bool(dones[t]) and float(demo_rewards[t]) > 0.0,
             )
 
 
@@ -368,7 +373,7 @@ def rollout_episode(env, agent: AWACAgent):
             flat_obs.copy(),
             flat_next_obs.copy(),
             action.astype(np.float32),
-            terminated or truncated,
+            terminated,
         ))
 
         obs_dict = next_obs_dict

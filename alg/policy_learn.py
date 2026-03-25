@@ -15,6 +15,8 @@ from utils.demos import prepare_demo_pool
 from utils.env_wrappers import ActionNormalizer, ResetWrapper, TimeLimitWrapper, reconstruct_state
 from alg.banana import feature_function
 
+REWARD_SCALE = 20.0
+
 
 def load_weights(path: Path) -> np.ndarray:
     """Read learned reward weights from feature_weights.csv."""
@@ -74,6 +76,9 @@ def load_demos_into_buffer(model, demos: List[Dict], weights: np.ndarray) -> Non
         actions = demo["action_trajectory"]
         next_states = demo["next_state_trajectory"]
         dones = demo["done_trajectory"].flatten()
+        # Distinguish true task termination (success) from time-limit truncation.
+        # In this project, sparse reward is positive (+1000) only on success.
+        demo_rewards = demo.get("reward_trajectory", np.zeros_like(dones)).flatten()
 
         T = len(actions)
 
@@ -90,7 +95,7 @@ def load_demos_into_buffer(model, demos: List[Dict], weights: np.ndarray) -> Non
         # Compute trajectory-level reward and distribute equally across steps
         features = feature_function(traj_pairs)
         trajectory_reward = float(np.dot(weights, features))
-        reward_per_step = trajectory_reward / max(T, 1)
+        reward_per_step = REWARD_SCALE * trajectory_reward / max(T, 1)
 
         # Insert every transition into the replay buffer
         for t in range(T):
@@ -107,7 +112,10 @@ def load_demos_into_buffer(model, demos: List[Dict], weights: np.ndarray) -> Non
 
             model.replay_buffer.add(
                 flat_obs, flat_next_obs, action,
-                np.array([reward_per_step]), np.array([done]), [{}],
+                np.array([reward_per_step]),
+                # Terminal only on true termination (success), not timeouts.
+                np.array([bool(dones[t]) and float(demo_rewards[t]) > 0.0]),
+                [{}],
             )
 
 
@@ -139,7 +147,7 @@ def rollout_episode(
             flat_obs.copy(),
             flat_next_obs.copy(),
             action.astype(np.float32),
-            terminated or truncated,
+            terminated,
         ))
 
         obs_dict = next_obs_dict
@@ -172,6 +180,9 @@ def main() -> None:
     models_dir = saved_dir / "policy_models"
     models_dir.mkdir(parents=True, exist_ok=True)
 
+    # Training horizon (must be available before calling SB3's internal setup).
+    max_steps = 500_000
+
     # ── Load learned reward weights ──────────────────────────────────────────
     weights = load_weights(saved_dir / "feature_weights.csv")
     print(f"Loaded weights: {weights}")
@@ -182,22 +193,32 @@ def main() -> None:
         "MlpPolicy",
         sac_env,
         verbose=0,
-        learning_starts=2000,
+        learning_starts=500,
         batch_size=256,
         buffer_size=300_000,
     )
+
+    # SB3 requires `_setup_learn()` before manually calling `model.train()`.
+    # It initializes `_logger` and internal counters used by learning-rate schedules.
+    model._setup_learn(total_timesteps=max_steps, reset_num_timesteps=True)
 
     # ── Intercept SB3 logger to capture actor / critic losses ────────────────
     # SB3 records losses inside train() and clears them on dump().
     # We sniff the values just before dump() clears name_to_value.
     _sac_losses: Dict = {}
-    _orig_dump = model.logger.dump
+    # Some SB3 versions initialize the logger lazily, so accessing `model.logger`
+    # can crash with: "AttributeError: 'SAC' object has no attribute '_logger'".
+    # In that case, we just skip loss capture (success curve still works).
+    try:
+        _orig_dump = model.logger.dump
 
-    def _capturing_dump(step: int = 0) -> None:
-        _sac_losses.update(model.logger.name_to_value)
-        _orig_dump(step)
+        def _capturing_dump(step: int = 0) -> None:
+            _sac_losses.update(model.logger.name_to_value)
+            _orig_dump(step)
 
-    model.logger.dump = _capturing_dump  # type: ignore[method-assign]
+        model.logger.dump = _capturing_dump  # type: ignore[method-assign]
+    except AttributeError:
+        print("[policy_learn] SB3 logger not initialized; skipping loss capture.")
 
     # ── Pre-fill buffer with expert demos ────────────────────────────────────
     demos = prepare_demo_pool(repo_root / "demo_data" / "PickAndPlace")
@@ -216,7 +237,6 @@ def main() -> None:
     rollout_env = make_rollout_env(render=False)
 
     total_steps = 0
-    max_steps = 500_000
     eval_interval = 1_000
     steps_since_eval = 0
     success_rates: List[float] = []
@@ -236,7 +256,7 @@ def main() -> None:
         # Step 2 — recover trajectory reward post-hoc from the full trajectory
         features = feature_function(traj_pairs)
         trajectory_reward = float(np.dot(weights, features))
-        reward_per_step = trajectory_reward / max(ep_steps, 1)
+        reward_per_step = REWARD_SCALE * trajectory_reward / max(ep_steps, 1)
 
         w_ep_rewards.append(trajectory_reward)
         w_ep_lengths.append(float(ep_steps))
@@ -251,10 +271,22 @@ def main() -> None:
         # Step 4 — update the policy (only once enough data is collected)
         total_steps += ep_steps
         model.num_timesteps = total_steps
+        # Keep SB3's progress remaining consistent with our custom rollout loop.
+        model._update_current_progress_remaining(
+            num_timesteps=model.num_timesteps, total_timesteps=max_steps
+        )
         if model.replay_buffer.size() >= model.learning_starts:
-            model.train(batch_size=model.batch_size, gradient_steps=ep_steps)
-            al = _sac_losses.get("train/actor_loss", np.nan)
-            cl = _sac_losses.get("train/critic_loss", np.nan)
+            # Cap the number of updates per episode for stability.
+            gradient_steps = min(ep_steps, 64)
+            model.train(batch_size=model.batch_size, gradient_steps=gradient_steps)
+            # Prefer reading from SB3 logger directly; fall back to intercepted
+            # values (for compatibility across SB3 versions).
+            try:
+                al = model.logger.name_to_value.get("train/actor_loss", np.nan)
+                cl = model.logger.name_to_value.get("train/critic_loss", np.nan)
+            except Exception:
+                al = _sac_losses.get("train/actor_loss", np.nan)
+                cl = _sac_losses.get("train/critic_loss", np.nan)
             if not np.isnan(float(al)):
                 w_actor_losses.append(float(al))
             if not np.isnan(float(cl)):
