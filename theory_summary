@@ -1,0 +1,275 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[a4paper,left=2.8cm,right=0.6cm,top=0.7cm,bottom=0.7cm]{geometry}
+\AtBeginDocument{\fontsize{8}{9.5}\selectfont}
+\usepackage{iftex}
+\ifPDFTeX
+  \usepackage[T1]{fontenc}
+  \usepackage[utf8]{inputenc}
+  \usepackage{lmodern}
+\else
+  \usepackage{fontspec}
+  % Try common OpenDyslexic font family names.
+  \IfFontExistsTF{OpenDyslexic}{
+    \setmainfont{OpenDyslexic}
+  }{
+    \IfFontExistsTF{OpenDyslexic-Regular}{
+      \setmainfont[
+        BoldFont=OpenDyslexic-Bold,
+        ItalicFont=OpenDyslexic-Italic,
+        BoldItalicFont=OpenDyslexic-Bold-Italic
+      ]{OpenDyslexic-Regular}
+    }{
+      \IfFontExistsTF{OpenDyslexic3}{
+        \setmainfont{OpenDyslexic3}
+      }{
+        \setmainfont{TeX Gyre Heros}
+      }
+    }
+  }
+\fi
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{microtype}
+
+% Make typography visually uniform across the document.
+\renewcommand{\textbf}[1]{#1}
+\renewcommand{\emph}[1]{#1}
+\setlength{\parskip}{0.3cm}
+\setlength{\parindent}{0pt}
+
+\begin{document}
+Imitation Learning: Learning from Expert Demonstrations
+
+In classical reinforcement learning, we specify a reward function that guides agent behavior. However, designing good reward functions is surprisingly difficult: they may not capture the true desired behavior, or worse, agents may exploit loopholes in the reward specification---a problem known as \emph{reward hacking}. Additionally, when rewards are sparse, learning becomes data-inefficient as the agent must explore extensively and experience many failures to make progress.
+
+Imitation learning offers an alternative approach. Rather than designing a reward function, we provide the agent with expert demonstrations---trajectories showing how an expert performs the task. The agent then learns to mimic this expert behavior. This approach can be more intuitive (showing is sometimes easier than describing), more data-efficient, and avoids the reward specification problem entirely.
+
+\vspace{0.3cm}
+Before diving into specific algorithms, it is important to understand the core components that any imitation learning system requires.
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Demonstrations} are the foundation: trajectories
+  \[
+  \xi = \{(x_0,u_0),(x_1,u_1),\ldots\}
+  \]
+  recorded from an expert agent executing the task. Each trajectory shows a sequence of states and the actions the expert took at each state.
+
+  \item \textbf{The environment or simulator} provides the context. It is modeled as a Markov decision process (MDP) with states \(x \in \mathcal{X}\), actions \(u \in \mathcal{U}\), and transition dynamics
+  \[
+  p(x_t \mid x_{t-1}, u_{t-1}),
+  \]
+  which determines which state follows from taking an action in a given state.
+
+  \item \textbf{The policy class} defines the functional form used to represent the learned policy. Common choices include support vector machines, neural networks, or linear policies. The policy is parameterized as \(\hat{\pi}_{\theta}\), where \(\theta\) are learnable parameters.
+
+  \item \textbf{The loss function} quantifies how far the policy's actions deviate from the expert's actions. For continuous action spaces, mean-squared error is common:
+  \[
+  L\!\left(\hat{\pi}(x), \pi^*(x)\right) = \left\lVert \hat{\pi}(x) - \pi^*(x) \right\rVert^2.
+  \]
+  For discrete actions, cross-entropy loss is standard.
+
+  \item \textbf{The learning algorithm} is the optimization procedure that adjusts policy parameters \(\theta\) to minimize loss on demonstration data.
+\end{itemize}
+
+\vspace{0.3cm}
+The imitation learning problem can be stated as follows: we are given expert demonstrations
+\[
+\Xi = \{\xi_1,\ldots,\xi_D\},
+\]
+where each trajectory is drawn from an unknown expert policy \(\pi^*\). The goal is to learn a policy \(\hat{\pi}\) that imitates \(\pi^*\) as closely as possible.
+
+This differs from reinforcement learning: we do not need extensive interaction with the environment or direct reward optimization. Instead, we extract behavior from demonstrations and replicate it.
+
+\vspace{0.3cm}
+Behavioral cloning treats imitation learning as supervised learning. If we observe expert actions in various states, we can train a classifier or regressor that maps states to actions.
+
+\vspace{0.3cm}
+\begin{enumerate}[leftmargin=*]
+  \item Collect state-action pairs \((x,u)\) from expert demonstrations.
+  \item Choose a policy class (e.g., a neural network).
+  \item Optimize \(\hat{\pi}_{\theta}\) to minimize
+  \[
+  L(\theta) = \sum_{(x,u)\in\Xi} L\!\left(\hat{\pi}_{\theta}(x),u\right).
+  \]
+\end{enumerate}
+
+For continuous actions:
+\[
+L\!\left(\hat{\pi}_{\theta}(x),u\right) = \left\lVert \hat{\pi}_{\theta}(x)-u \right\rVert^2.
+\]
+For discrete actions, use cross-entropy loss.
+
+\vspace{0.3cm}
+Behavioral cloning is simple and often works initially. But it assumes training and test distributions are identical. During training, we see expert-generated states. During deployment, the learned policy generates its own trajectories, potentially visiting unseen states. Prediction errors in these states compound over time.
+
+This is called \emph{distributional shift} (or covariate shift).
+
+\vspace{0.3cm}
+Suppose a robot learns navigation from expert trajectories. During training, it only sees states the expert visits. If the learned policy makes a small error, it may enter a novel state absent from training data. It then extrapolates poorly, producing further errors that cascade.
+
+Mathematically, behavioral cloning violates the i.i.d.\ assumption of supervised learning: the test distribution (states visited by \(\hat{\pi}\)) differs from the training distribution (states visited by \(\pi^*\)).
+
+Typical causes:
+\begin{itemize}[leftmargin=*]
+  \item Limited demonstration diversity (expert covers only part of state space),
+  \item Embodiment differences (learner platform differs from expert),
+  \item Environmental stochasticity (small perturbations accumulate).
+\end{itemize}
+
+\vspace{0.3cm}
+DAgger (Dataset Aggregation) addresses distributional shift by training not only on expert states, but also on states visited by the learner.
+
+\vspace{0.3cm}
+\begin{enumerate}[leftmargin=*]
+  \item Initialize with expert data:
+  \[
+  D=\{(x,u):(x,u)\in\Xi\}.
+  \]
+  \item At iteration \(i\), roll out current policy \(\hat{\pi}_i\) to obtain visited states \(\{x_0,x_1,x_2,\ldots\}\).
+  \item Query the expert at each visited state:
+  \[
+  u_t = \pi^*(x_t).
+  \]
+  \item Aggregate new pairs \((x_t,\pi^*(x_t))\) into \(D\).
+  \item Retrain to obtain \(\hat{\pi}_{i+1}\) on aggregated \(D\).
+  \item Repeat until performance plateaus.
+\end{enumerate}
+
+A common variant uses a mixed policy:
+\[
+\pi_i(x) = \beta_i \pi^*(x) + (1-\beta_i)\hat{\pi}_i(x),
+\]
+with decreasing \(\beta_i\), encouraging exploration of learner-induced states while retaining stability.
+
+\vspace{0.3cm}
+By labeling states actually visited by the learner, DAgger aligns training and deployment distributions, directly mitigating covariate shift.
+
+\vspace{0.3cm}
+Under suitable assumptions, if the expert can provide correct actions on learner-visited states, mistake rates decrease across iterations and performance approaches expert level.
+
+Note on computational cost: DAgger requires repeatedly executing the policy and requesting expert feedback. If the expert is human, this can be expensive. If expert feedback is automated (e.g., via a simulator oracle), DAgger becomes very practical. In practice, people often run DAgger for only a few iterations to balance labeling cost and performance gains.
+
+\vspace{0.3cm}
+Behavioral cloning learns \emph{what} action to take. Inverse reinforcement learning (IRL) asks \emph{why} the expert acts that way by inferring an underlying reward function.
+
+\vspace{0.3cm}
+Assume expert reward is linear in features:
+\[
+R(x,u) = w^\top \phi(x,u),
+\]
+where \(\phi(x,u)\) are hand-designed features and \(w\) is an unknown weight vector.
+
+If \(w\) were known, we could train an RL policy maximizing
+\[
+\sum_{t=0}^{T-1}\gamma^t R(x_t,u_t).
+\]
+IRL seeks to recover \(w\) from demonstrations.
+
+\vspace{0.3cm}
+For expert policy \(\pi^*\), a key condition is
+\[
+{w^*}^\top \mu(\pi^*,x)\ge {w^*}^\top \mu(\pi,x), \quad \forall \pi,
+\]
+where \(\mu(\pi,x)\) is the feature expectation:
+\[
+\mu(\pi,x)=\mathbb{E}_{\pi}\!\left[\sum_{t=0}^{T-1}\gamma^t\phi\!\left(x_t,\pi(x_t)\right)\,\middle|\,x_0=x\right].
+\]
+
+\vspace{0.3cm}
+Multiple reward functions can explain the same behavior. Therefore, exact \(w^*\) is generally not uniquely identifiable; only an equivalence class is.
+
+\vspace{0.3cm}
+Apprenticeship learning avoids exact reward recovery and instead aims to match expert feature expectations.
+
+\vspace{0.3cm}
+Maintain candidate policies \(\pi_1,\ldots,\pi_i\). At each iteration:
+\begin{enumerate}[leftmargin=*]
+  \item Solve a max-margin problem:
+  \[
+  \max_{\|w\|\le 1}\ \min_j\ \left(w^\top\mu(\pi^*,x)-w^\top\mu(\pi_j,x)\right).
+  \]
+  \item Train a new RL policy under reward \(R_w(x,u)=w^\top\phi(x,u)\).
+  \item Stop when margin \(<\epsilon\).
+\end{enumerate}
+
+\vspace{0.3cm}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Pros:} better generalization, intent capture, improved transfer.
+  \item \textbf{Cons:} expensive, since each iteration requires RL training.
+\end{itemize}
+
+Feature design: Apprenticeship learning (and IRL generally) requires hand-designed features \(\phi(x,u)\). This is itself a significant engineering task. In domains where good features are hard to specify, direct policy learning methods may be more practical. Modern approaches often use deep neural networks to learn representations end-to-end, blurring the line between feature-based and direct policy learning.
+
+\vspace{0.3cm}
+Use direct policy learning (Behavioral Cloning, DAgger) when:
+\begin{itemize}[leftmargin=*]
+  \item You need fast/simple training,
+  \item Demonstrations are high quality and representative,
+  \item Compute resources are limited,
+  \item Exceeding expert performance is not a core objective.
+\end{itemize}
+
+\vspace{0.3cm}
+Use IRL/Apprenticeship Learning when:
+\begin{itemize}[leftmargin=*]
+  \item Generalization and transfer are priorities,
+  \item You want interpretable preferences,
+  \item You can afford repeated RL optimization.
+\end{itemize}
+
+A practical strategy: start with behavioral cloning or DAgger; move to IRL only if direct imitation falls short.
+
+\vspace{0.3cm}
+In practice, boundaries between imitation learning and reinforcement learning are often blurred. Hybrid approaches combine both:
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Imitation + RL fine-tuning:} Train an initial policy with behavioral cloning or DAgger, then fine-tune via RL with a designed reward. This keeps imitation's sample efficiency while enabling performance beyond the expert.
+  \item \textbf{Reward learning + RL:} Infer a reward (e.g., with apprenticeship learning), then continue RL optimization on that reward.
+  \item \textbf{Auxiliary imitation loss:} Train with an RL objective plus an imitation term to keep behavior close to expert demonstrations, improving exploration and stability.
+\end{itemize}
+
+These combinations are increasingly common in practical systems because they leverage strengths of both paradigms.
+
+\vspace{0.3cm}
+In real-world settings, expert demonstrations depend on the data collection interface. Common approaches include:
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Kinesthetic manipulation:} Expert physically guides the robot arm. Useful for manipulation, but requires specialized hardware.
+  \item \textbf{Teleoperation:} Expert controls the robot remotely (e.g., joystick/haptics). Flexible but cognitively demanding.
+  \item \textbf{Motion capture:} Human motion is recorded and mapped to the robot. Effective for some tasks, but prone to embodiment mismatch.
+  \item \textbf{Immersive VR:} Expert controls an avatar in simulation. Scalable, but may introduce perception/tactile discrepancies.
+  \item \textbf{Game-like simulators:} Demonstrations collected through simulation interfaces. Easy to scale, but may miss real-world complexity.
+\end{itemize}
+
+Key interface challenges:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Dimensionality mismatch:} Human and robot control spaces have different degrees of freedom.
+  \item \textbf{Embodiment correspondence:} Human and robot morphologies differ, so equivalent actions are non-trivial.
+  \item \textbf{Visual occlusions:} Imperfect observability through interfaces can degrade demonstration quality.
+\end{itemize}
+
+These practical issues motivate imitation methods robust to noisy or multi-modal demonstrations and adaptable across embodiments.
+
+\vspace{0.3cm}
+Imitation learning is effective when:
+\begin{itemize}[leftmargin=*]
+  \item expert demonstrations are available,
+  \item reward design is difficult,
+  \item sample efficiency is important.
+\end{itemize}
+
+Behavioral cloning is the simplest baseline. DAgger is the natural fix for distributional shift. IRL and apprenticeship learning are useful for generalization and interpretability, at higher computational cost. In many practical systems, hybrid imitation+RL pipelines perform best.
+
+\vspace{0.3cm}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Imitation learning:} A machine-learning paradigm where an agent learns tasks by mimicking expert demonstrations rather than optimizing a manually designed reward.
+  \item \textbf{Behavioral cloning:} A supervised approach mapping states directly to expert actions via a state-action loss.
+  \item \textbf{DAgger:} An iterative imitation algorithm that queries expert corrections on learner-visited states and aggregates them to reduce distributional shift.
+  \item \textbf{Inverse reinforcement learning:} Infers the reward function optimized by the expert from demonstrations.
+  \item \textbf{Distributional shift:} Mismatch between training-state distribution (expert trajectories) and deployment-state distribution (learner trajectories), causing compounding errors.
+  \item \textbf{Apprenticeship learning:} An IRL-style method matching expert feature expectations without requiring exact recovery of expert reward parameters.
+\end{itemize}
+
+\end{document}

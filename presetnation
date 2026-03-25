@@ -297,6 +297,250 @@ Then RL improves it.
 \end{frame}
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Code Deep Dive (6 slides)}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{frame}[fragile]{Code Deep Dive 1/6 --- \texttt{utils/demos.py}}
+\textbf{Goal:} transform CSV logs in \texttt{demo\_data/PickAndPlace} into episode dictionaries.
+
+\vspace{0.1cm}
+\texttt{prepare\_demo\_pool(...)} line-by-line logic:
+\begin{itemize}
+  \item \texttt{np.genfromtxt(...)} loads \texttt{state\_traj.csv}, \texttt{action\_traj.csv}, \texttt{next\_state\_traj.csv}, etc.
+  \item marker rows (\texttt{state\_traj[:,0] == inf}) identify where each episode starts.
+  \item for each episode slice \texttt{sl = slice(start+1, end)}:
+    \begin{itemize}
+      \item \texttt{state\_trajectory = state\_traj[sl,:]}
+      \item \texttt{action\_trajectory = action\_traj[sl,:]}
+      \item \texttt{next\_state\_trajectory = next\_state\_traj[sl,:]}
+      \item \texttt{done\_trajectory = done\_traj[sl,:]}
+    \end{itemize}
+  \item returns a \texttt{List[Dict]} where each item is one full episode.
+\end{itemize}
+
+\textbf{Why this matters:} all later stages (clips, preference learning, replay-buffer warm start) depend on clean episodic splitting.
+\end{frame}
+
+\begin{frame}[fragile]{Code Deep Dive 2/6 --- \texttt{alg/banana.py} \texttt{feature\_function}}
+\textbf{Goal:} compute trajectory-level features $\phi(\tau)$ from one episode.
+
+\vspace{0.1cm}
+\texttt{feature\_function(traj\_pairs)}:
+\begin{itemize}
+  \item loops over each \texttt{(state, action)} pair
+  \item reads:
+    \begin{itemize}
+      \item \texttt{ee\_pos = obs[0:3]}
+      \item \texttt{banana\_pos = obs[7:10]}
+      \item \texttt{goal = state["desired\_goal"]}
+    \end{itemize}
+  \item accumulates distances:
+    \begin{itemize}
+      \item \texttt{ee\_to\_banana\_dists}
+      \item \texttt{banana\_to\_plate\_dists}
+    \end{itemize}
+  \item returns three features:
+    \begin{itemize}
+      \item \texttt{f1 = -min(ee\_to\_banana)} (did arm approach object?)
+      \item \texttt{f2 = -min(banana\_to\_plate)} (did object approach target?)
+      \item \texttt{f3 = -final(banana\_to\_plate)} (did it end near target?)
+    \end{itemize}
+\end{itemize}
+
+\textbf{Why negative?} smaller distance should mean \emph{better}, so we negate to make better trajectories score higher.
+\end{frame}
+
+\begin{frame}[fragile]{Code Deep Dive 3/6 --- \texttt{alg/banana.py} \texttt{main}}
+\textbf{Goal:} build the initial preference-learning dataset.
+
+\vspace{0.1cm}
+\texttt{main()} flow:
+\begin{enumerate}
+  \item create wrapped env: \texttt{PnPNewRobotEnv -> ResetWrapper -> ActionNormalizer -> TimeLimitWrapper}
+  \item load 20 expert demos via \texttt{prepare\_demo\_pool}
+  \item for each expert demo:
+    \begin{itemize}
+      \item replay actions with \texttt{rollout(...)}
+      \item capture frames
+      \item save \texttt{expert\_XX.mp4}
+      \item compute and store feature vector
+    \end{itemize}
+  \item generate 10 random episodes with \texttt{random\_rollout(...)}
+  \item save \texttt{random\_XX.mp4} + features
+  \item serialize everything to \texttt{saved/trajectory\_records.json}
+\end{enumerate}
+
+\textbf{Why this matters:} APReL needs trajectories that are both visualizable (clips) and featurized (for reward inference).
+\end{frame}
+
+\begin{frame}[fragile]{Code Deep Dive 4/6 --- \texttt{alg/pref\_learn.py}}
+\textbf{Goal:} infer reward weights from human comparisons.
+
+\vspace{0.1cm}
+\texttt{learn\_weights(...)} line-by-line idea:
+\begin{itemize}
+  \item initialize random normalized weight guess
+  \item define APReL user model + posterior belief:
+    \begin{itemize}
+      \item \texttt{SoftmaxUser}
+      \item \texttt{SamplingBasedBelief}
+    \end{itemize}
+  \item create query optimizer over discrete trajectory set:
+    \texttt{QueryOptimizerDiscreteTrajectorySet(traj\_set)}
+  \item force pairwise comparisons:
+    \texttt{query\_template = PreferenceQuery(traj\_set[:2])}
+  \item for each of 10 queries:
+    \begin{itemize}
+      \item \texttt{optimizer.optimize(acquisition\_function, belief, query\_template)}
+      \item \texttt{human.respond(query)} (keyboard feedback)
+      \item \texttt{belief.update(Preference(query, response))}
+    \end{itemize}
+  \item return posterior mean weights and save to \texttt{saved/feature\_weights.csv}
+\end{itemize}
+
+\textbf{Why this matters:} this converts human preference signal into a numeric reward model.
+\end{frame}
+
+\begin{frame}[fragile]{Code Deep Dive 5/6 --- \texttt{alg/policy\_learn.py}}
+\textbf{Goal:} train SAC with episodic post-hoc reward recovery.
+
+\vspace{0.1cm}
+Core functions:
+\begin{itemize}
+  \item \texttt{load\_demos\_into\_buffer(...)}:
+    \begin{itemize}
+      \item computes episode reward from \texttt{feature\_function}
+      \item distributes reward per step
+      \item inserts expert transitions in replay buffer before training
+    \end{itemize}
+  \item \texttt{rollout\_episode(...)}:
+    \begin{itemize}
+      \item executes one full episode with current policy
+      \item collects both trajectory pairs (for features) and transitions (for replay)
+    \end{itemize}
+  \item \texttt{main()} training loop:
+    \begin{itemize}
+      \item rollout one episode
+      \item compute $R(\tau)=w^\top\phi(\tau)$
+      \item add transitions with \texttt{reward\_per\_step}
+      \item call \texttt{model.train(...)}
+      \item every 1k steps evaluate over 10 runs and save checkpoint
+    \end{itemize}
+\end{itemize}
+
+\textbf{Why this matters:} exactly matches the assignment's required episodic loop.
+\end{frame}
+
+\begin{frame}[fragile]{Code Deep Dive 6/6 --- \texttt{alg/policy\_test.py}}
+\textbf{Goal:} TA-friendly API to load final policy and query actions.
+
+\vspace{0.1cm}
+\texttt{load\_final\_policy(path, algo)}:
+\begin{itemize}
+  \item for SAC: \texttt{return SAC.load(path)}
+  \item for AWAC: instantiate \texttt{AWACAgent}, then \texttt{agent.load(path)}
+\end{itemize}
+
+\texttt{get\_policy\_action(state, model)}:
+\begin{itemize}
+  \item flatten dict state using \texttt{reconstruct\_state(state)}
+  \item SAC branch: \texttt{model.predict(flat\_state, deterministic=True)}
+  \item AWAC branch: \texttt{agent.get\_action(flat\_state, deterministic=True)}
+\end{itemize}
+
+\textbf{Why this matters:} evaluators can call two simple functions without caring about internal training code.
+\end{frame}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Theory Deep Dive (4 slides)}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{frame}{Theory 1/4 --- Preference-Based Reward Learning}
+\textbf{Unknown objective:} the human's true reward is not given directly.
+
+\vspace{0.1cm}
+Assume linear trajectory reward:
+\[
+R_w(\tau) = w^\top \phi(\tau)
+\]
+where:
+\begin{itemize}
+  \item $\phi(\tau)$ = designed trajectory features
+  \item $w$ = unknown preference weights to infer
+\end{itemize}
+
+Human gives comparisons instead of numeric labels:
+\[
+\tau_A \succ \tau_B \;\Rightarrow\; R_w(\tau_A) > R_w(\tau_B)
+\]
+
+\textbf{Key idea:} use many pairwise choices to estimate $w$.
+\end{frame}
+
+\begin{frame}{Theory 2/4 --- APReL Bayesian Inference + Active Queries}
+APReL maintains a \textbf{belief distribution} over possible weights:
+\[
+p(w \mid \mathcal{D})
+\]
+where $\mathcal{D}$ is the set of observed human preferences.
+
+\vspace{0.1cm}
+After each new response:
+\begin{itemize}
+  \item posterior is updated (SamplingBasedBelief / MCMC samples)
+  \item uncertainty over $w$ shrinks
+\end{itemize}
+
+Active learning with acquisition function (e.g., mutual information):
+\begin{itemize}
+  \item choose the next pair expected to be most informative
+  \item ask fewer but better questions (query budget = 10)
+\end{itemize}
+
+\textbf{Outcome:} posterior mean of $w$ becomes the learned reward weights.
+\end{frame}
+
+\begin{frame}{Theory 3/4 --- RL from Demonstrations with Learned Reward}
+After reward recovery, policy learning solves:
+\[
+\max_{\pi} \; \mathbb{E}_{\tau \sim \pi}\left[\sum_t r_t\right]
+\]
+but here $r_t$ comes from episodic post-hoc reward:
+\[
+R(\tau)=w^\top \phi(\tau), \quad r_t \approx \frac{R(\tau)}{T}
+\]
+
+\vspace{0.1cm}
+Why demos help:
+\begin{itemize}
+  \item replay buffer starts with near-success trajectories
+  \item critic gets useful value targets early
+  \item actor avoids wasting time in pure random exploration
+\end{itemize}
+
+\textbf{Result:} better sample efficiency in sparse-reward robotics tasks.
+\end{frame}
+
+\begin{frame}{Theory 4/4 --- Why This Assignment Design Works}
+This assignment combines three signals:
+\begin{enumerate}
+  \item \textbf{Demonstrations} give strong initialization (what good behavior looks like)
+  \item \textbf{Preferences} shape reward to human intent (what should be optimized)
+  \item \textbf{RL updates} improve policy through trial-and-error
+\end{enumerate}
+
+\vspace{0.1cm}
+Trade-off insight:
+\begin{itemize}
+  \item too few queries $\Rightarrow$ noisy reward estimate
+  \item too many queries $\Rightarrow$ expensive human effort
+  \item active query selection addresses this by asking informative pairs
+\end{itemize}
+
+\textbf{Final interpretation:} preference learning answers \emph{what to optimize}; RLfD answers \emph{how to control}.
+\end{frame}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \section{SAC vs AWAC (what to say in the report)}
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 

@@ -115,13 +115,13 @@ def prefill_expert_demos_into_buffer(
             flat_next_obs = np.concatenate(
                 [next_states[t, :19].astype(np.float32), states[t, 19:22].astype(np.float32)]
             )
-        replay_buffer.add(
-            flat_obs,
-            flat_next_obs,
-            actions[t].astype(np.float32),
-            reward_per_step,
-            bool(dones[t]),
-        )
+            replay_buffer.add(
+                flat_obs,
+                flat_next_obs,
+                actions[t].astype(np.float32),
+                reward_per_step,
+                bool(dones[t]),
+            )
 
 
 def rollout_one_episode_with_frames(
@@ -272,7 +272,7 @@ def main() -> None:
         ep_rewards_window: List[float] = []
         ep_lengths_window: List[float] = []
 
-        rollout_env = make_rollout_env(render=False)  
+        rollout_env = make_rollout_env(render=False)
 
         total_steps = 0
         steps_since_eval = 0
@@ -332,7 +332,7 @@ def main() -> None:
             # 6) Add rolled-out trajectory to APReL dataset + save clip
             # ---------------------------------------------------------
             clip_path = clips_dir / f"online_awac_ep{episode_idx:04d}_step{total_steps:07d}.mp4"
-            save_frames_to_mp4(frames, clip_path=clip_path)
+            save_frames_to_mp4(frames, out_path=clip_path)
 
             online_record = TrajectoryRecord(
                 clip_path=str(clip_path),

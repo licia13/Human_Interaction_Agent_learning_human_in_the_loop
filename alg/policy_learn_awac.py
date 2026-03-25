@@ -18,6 +18,8 @@ from utils.demos import prepare_demo_pool
 from utils.env_wrappers import ActionNormalizer, ResetWrapper, TimeLimitWrapper, reconstruct_state
 from alg.banana import feature_function
 
+REWARD_SCALE = 20.0
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Utility
@@ -318,7 +320,7 @@ def load_demos_into_buffer(
         # Trajectory-level reward → distributed equally across steps
         features = feature_function(traj_pairs)
         traj_reward = float(np.dot(weights, features))
-        reward_per_step = traj_reward / max(T, 1)
+        reward_per_step = REWARD_SCALE * traj_reward / max(T, 1)
 
         for t in range(T):
             flat_obs = np.concatenate([
@@ -427,8 +429,10 @@ def main() -> None:
         tau=0.005,
         actor_lr=3e-4,
         critic_lr=3e-4,
-        lambda_awac=0.3,
-        n_action_samples=16,
+        # Softer advantage weighting is more stable for sparse/indirect rewards.
+        lambda_awac=1.0,
+        # More action samples makes V(s) less noisy.
+        n_action_samples=32,
         batch_size=256,
     )
     replay_buffer = ReplayBuffer(OBS_DIM, ACTION_DIM, capacity=300_000)
@@ -442,8 +446,16 @@ def main() -> None:
     # ── Open metrics CSV ──────────────────────────────────────────────────────
     metrics_path = saved_dir / "metrics_awac.csv"
     metrics_file = open(metrics_path, "w", newline="")
-    _fields = ["steps", "success_rate", "ep_reward", "ep_length",
-               "actor_loss", "critic_loss"]
+    _fields = [
+        "steps",
+        "success_rate",
+        "ep_reward",
+        "ep_length",
+        "actor_loss",
+        "critic_loss",
+        "replay_size",
+        "reward_scale",
+    ]
     metrics_writer = csv.DictWriter(metrics_file, fieldnames=_fields)
     metrics_writer.writeheader()
 
@@ -453,7 +465,7 @@ def main() -> None:
     total_steps = 0
     max_steps = 500_000
     eval_interval = 1_000
-    learning_starts = 2_000
+    learning_starts = 500
     steps_since_eval = 0
     success_rates: List[float] = []
     checkpoints: List[int] = []
@@ -472,7 +484,7 @@ def main() -> None:
         # Step 2 — recover trajectory reward post-hoc from the full trajectory
         features = feature_function(traj_pairs)
         traj_reward = float(np.dot(weights, features))
-        reward_per_step = traj_reward / max(ep_steps, 1)
+        reward_per_step = REWARD_SCALE * traj_reward / max(ep_steps, 1)
 
         w_ep_rewards.append(traj_reward)
         w_ep_lengths.append(float(ep_steps))
@@ -486,7 +498,8 @@ def main() -> None:
 
         # Step 4 — update the policy once enough data is collected
         if replay_buffer.size() >= learning_starts:
-            al, cl = agent.train(replay_buffer, gradient_steps=ep_steps)
+            # Avoid huge update bursts early in training.
+            al, cl = agent.train(replay_buffer, gradient_steps=min(ep_steps, 64))
             if not np.isnan(al):
                 w_actor_losses.append(al)
             if not np.isnan(cl):
@@ -507,6 +520,8 @@ def main() -> None:
                 "ep_length":    np.mean(w_ep_lengths)    if w_ep_lengths    else np.nan,
                 "actor_loss":   np.mean(w_actor_losses)  if w_actor_losses  else np.nan,
                 "critic_loss":  np.mean(w_critic_losses) if w_critic_losses else np.nan,
+                "replay_size":  replay_buffer.size(),
+                "reward_scale": REWARD_SCALE,
             })
             metrics_file.flush()
 

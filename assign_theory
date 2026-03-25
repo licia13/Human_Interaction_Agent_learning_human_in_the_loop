@@ -1,0 +1,197 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[a4paper,left=2.8cm,right=0.6cm,top=0.7cm,bottom=0.7cm]{geometry}
+\AtBeginDocument{\fontsize{8}{9.5}\selectfont}
+\usepackage{iftex}
+\ifPDFTeX
+  \usepackage[T1]{fontenc}
+  \usepackage[utf8]{inputenc}
+  \usepackage{lmodern}
+\else
+  \usepackage{fontspec}
+  \IfFontExistsTF{OpenDyslexic}{
+    \setmainfont{OpenDyslexic}
+  }{
+    \IfFontExistsTF{OpenDyslexic-Regular}{
+      \setmainfont[
+        BoldFont=OpenDyslexic-Bold,
+        ItalicFont=OpenDyslexic-Italic,
+        BoldItalicFont=OpenDyslexic-Bold-Italic
+      ]{OpenDyslexic-Regular}
+    }{
+      \setmainfont{TeX Gyre Heros}
+    }
+  }
+\fi
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{microtype}
+
+\renewcommand{\textbf}[1]{#1}
+\renewcommand{\emph}[1]{#1}
+\setlength{\parskip}{0.3cm}
+\setlength{\parindent}{0pt}
+
+\begin{document}
+HIAL Project Theory and Assignment Deep Dive
+
+This document explains the full logic of the HIAL assignment in a continuous theory-first format. The project combines preference-based reward learning and reinforcement learning from demonstrations (RLfD) for a UR5 food-serving task: pick a banana and place it on a plate. The key challenge is that the native environment reward is sparse, so direct trial-and-error learning is inefficient. The assignment addresses this by first recovering a dense reward proxy from human preferences and then using that learned reward to train control policies.
+
+\section*{Problem Setting and Motivation}
+
+The environment state is goal-conditioned and represented by a dictionary with observation, achieved goal, and desired goal. The observation includes robot kinematics and object dynamics; the desired goal is the fixed plate center. The action is continuous and controls end-effector displacement plus gripper opening/closing.
+
+The task reward provided by the simulator is sparse: success yields a large positive terminal value, while non-success steps receive a small negative penalty. Sparse rewards are problematic because early random policies almost never hit success states, producing weak learning signals and high sample complexity. The assignment therefore asks for preference-based reward recovery before policy learning.
+
+\section*{Data: What We Actually Have}
+
+The project has several data sources that play different roles.
+
+\begin{itemize}[leftmargin=*]
+  \item Expert demonstrations in \texttt{demo\_data/PickAndPlace} contain episodic trajectories with arrays for states, actions, next states, rewards, and done flags.
+  \item Video clips generated from expert and random rollouts act as visual query objects for human preference collection.
+  \item Trajectory-level feature vectors summarize each clip through hand-designed geometric signals.
+  \item Human preference responses over clip pairs provide supervised information about relative trajectory quality.
+  \item Replay buffer data stores transition tuples used by off-policy RL updates.
+\end{itemize}
+
+An expert demo episode can be written as
+\[
+\tau = \{(s_0,a_0,s_1,d_0), \ldots, (s_{T-1},a_{T-1},s_T,d_{T-1})\}.
+\]
+These episodes are not only replay assets; they are used to initialize policy learning so the agent starts from behaviorally relevant regions of state-action space.
+
+\section*{Phase 1.1: Trajectory Features and Clip Dataset}
+
+The first assignment block asks for two outputs: trajectory features and 30 clips (20 expert + 10 random). In implementation terms, \texttt{alg/banana.py} does the following:
+
+\begin{enumerate}[leftmargin=*]
+  \item Builds the wrapped environment (\texttt{ResetWrapper}, \texttt{ActionNormalizer}, \texttt{TimeLimitWrapper}).
+  \item Replays each expert action sequence and records frames.
+  \item Rolls out random policies for additional contrastive trajectories.
+  \item Computes a feature vector per trajectory and stores all metadata in \texttt{saved/trajectory\_records.json}.
+\end{enumerate}
+
+The feature map is trajectory-level:
+\[
+\phi(\tau) = [f_1(\tau), f_2(\tau), f_3(\tau)].
+\]
+In this project, features are distance-based (arm-to-banana and banana-to-plate statistics). Distances are negated so higher values correspond to better trajectories:
+\[
+f_1 = -\min_t d(\text{ee}_t,\text{banana}_t), \quad
+f_2 = -\min_t d(\text{banana}_t,\text{goal}), \quad
+f_3 = -d(\text{banana}_T,\text{goal}).
+\]
+This gives a compact trajectory quality representation that is differentiable with respect to behavior quality but independent of sparse environment reward.
+
+\section*{Phase 1.2: Preference Learning with APReL}
+
+The second block asks to recover reward weights from human pairwise preferences using APReL. The central assumption is a linear reward model:
+\[
+R_w(\tau) = w^\top \phi(\tau),
+\]
+where $w$ is unknown and must be inferred from comparison feedback.
+
+The implemented \texttt{alg/pref\_learn.py} pipeline:
+
+\begin{enumerate}[leftmargin=*]
+  \item Loads trajectory records and converts them into an APReL \texttt{TrajectorySet}.
+  \item Initializes a user model and belief over reward weights.
+  \item Uses \texttt{QueryOptimizerDiscreteTrajectorySet} with a pairwise \texttt{PreferenceQuery} template.
+  \item Repeats for 10 queries: optimize query, ask human, update posterior belief.
+  \item Saves posterior-mean weights to \texttt{saved/feature\_weights.csv}.
+\end{enumerate}
+
+At a conceptual level, each response imposes relative constraints such as
+\[
+\tau_A \succ \tau_B \;\Longrightarrow\; w^\top\phi(\tau_A) > w^\top\phi(\tau_B),
+\]
+and Bayesian updates gradually concentrate belief mass around weights consistent with observed choices.
+
+Active query selection via an acquisition function (e.g., mutual information) improves label efficiency by selecting the most informative trajectory pairs under current uncertainty.
+
+\section*{Phase 2: RL from Demonstrations with Learned Reward}
+
+The policy-learning phase asks for an episodic training loop with post-hoc reward recovery. This is implemented in \texttt{alg/policy\_learn.py} (SAC version), and conceptually follows:
+
+\begin{enumerate}[leftmargin=*]
+  \item Pre-fill replay buffer with expert transitions.
+  \item Roll out current policy for one full episode.
+  \item Compute trajectory features and reward with current learned weights.
+  \item Distribute trajectory reward across episode steps and add transitions to replay buffer.
+  \item Update policy using off-policy gradient steps.
+  \item Evaluate every 1k environment steps over 10 randomized test runs.
+\end{enumerate}
+
+Trajectory reward is computed as
+\[
+R(\tau) = w^\top\phi(\tau),
+\]
+and transformed into per-transition labels as
+\[
+r_t = \frac{R(\tau)}{T}.
+\]
+This is a practical post-hoc reward assignment that preserves the assignment's episodic requirement while remaining compatible with standard off-policy replay mechanisms.
+
+\section*{Why Demonstrations Help Learning}
+
+Without demonstration seeding, early replay data is dominated by low-quality random behavior. Expert prefill changes the initial data distribution:
+
+\begin{itemize}[leftmargin=*]
+  \item Critic targets become informative earlier.
+  \item Actor updates are anchored around successful manipulation patterns.
+  \item Exploration burden is reduced in sparse-reward regions.
+\end{itemize}
+
+This is exactly the motivation of RLfD: demonstrations improve sample efficiency while RL still enables further policy improvement.
+
+\section*{SAC and AWAC in This Context}
+
+SAC is a strong continuous-control baseline with entropy-regularized actor updates and twin-critic value estimation. AWAC emphasizes advantage-weighted behavior fitting, often particularly effective in offline/online demonstration-rich settings. In this project, SAC satisfies the required assignment; AWAC provides an additional comparison and can be used for deeper analysis.
+
+\section*{Extra Credit Theory: Single-Loop Online Integration}
+
+The optional extra credit removes strict phase separation and asks for an online loop where reward learning and policy learning interact each episode:
+
+\begin{enumerate}[leftmargin=*]
+  \item Ask for new human preferences.
+  \item Update reward belief and recover new weights.
+  \item Roll out current policy and compute rewards with those updated weights.
+  \item Update the policy.
+  \item Add new rollout trajectory and clip to the preference set for future querying.
+\end{enumerate}
+
+This creates a closed feedback loop between reward inference and control learning. Mathematically, both the reward estimate $w_k$ and policy $\pi_k$ evolve over episodes:
+\[
+w_{k+1} \leftarrow \text{BeliefUpdate}(w_k,\text{new preferences}), \qquad
+\pi_{k+1} \leftarrow \text{RLUpdate}(\pi_k, R_{w_{k+1}}).
+\]
+The approach is more adaptive but operationally heavier because it requires ongoing human interaction.
+
+\section*{Code-to-Assignment Mapping}
+
+The project requirements map directly to the following scripts:
+
+\begin{itemize}[leftmargin=*]
+  \item \texttt{alg/banana.py}: feature design + 30 clips + trajectory records.
+  \item \texttt{alg/pref\_learn.py}: APReL preference loop + learned weight export.
+  \item \texttt{alg/policy\_learn.py}: episodic RLfD with learned reward and checkpointed training.
+  \item \texttt{alg/policy\_test.py}: TA-facing policy loading and action query API.
+\end{itemize}
+
+Expected artifacts in \texttt{saved/} include clips, trajectory records, learned feature weights, policy checkpoints, and learning curves.
+
+\section*{Conclusion}
+
+The assignment is a full pipeline from subjective human preference to executable robot behavior:
+
+\begin{itemize}[leftmargin=*]
+  \item features encode trajectory semantics,
+  \item APReL converts pairwise preferences into a reward model,
+  \item RLfD uses that model plus demonstrations to learn a control policy.
+\end{itemize}
+
+Conceptually, preference learning answers what should be optimized, while policy learning answers how to optimize it in continuous control.
+
+\end{document}
